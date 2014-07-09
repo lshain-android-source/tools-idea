@@ -1,0 +1,481 @@
+/*
+ * Copyright 2000-2013 JetBrains s.r.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.intellij.ide;
+
+import com.intellij.Patches;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.components.ApplicationComponent;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.util.Pair;
+import com.intellij.openapi.util.Ref;
+import com.intellij.openapi.util.SystemInfo;
+import com.intellij.openapi.util.registry.Registry;
+import com.intellij.ui.mac.foundation.Foundation;
+import com.intellij.ui.mac.foundation.ID;
+import com.sun.jna.IntegerType;
+import org.jetbrains.annotations.NonNls;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import sun.awt.datatransfer.DataTransferer;
+
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.List;
+
+/**
+ * <p>This class is used to workaround the problem with getting clipboard contents (http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=4818143).
+ * Although this bug is marked as fixed actually Sun just set 10 seconds timeout for {@link java.awt.datatransfer.Clipboard#getContents(Object)}
+ * method which may cause unacceptably long UI freezes. So we worked around this as follows:
+ * <ul>
+ * <li>for Macs we perform synchronization with system clipboard on a separate thread and schedule it when IDEA frame is activated
+ * or Copy/Cut action in Swing component is invoked, and use native method calls to access system clipboard lock-free (?);</li>
+ * <li>for X Window we temporary set short timeout and check for available formats (which should be fast if a clipboard owner is alive).</li>
+ * </ul>
+ * </p>
+ *
+ * @author nik
+ */
+public class ClipboardSynchronizer implements ApplicationComponent {
+  private static final Logger LOG = Logger.getInstance("#com.intellij.ide.ClipboardSynchronizer");
+
+  @NonNls private static final String DATA_TRANSFER_TIMEOUT_PROPERTY = "sun.awt.datatransfer.timeout";
+  @NonNls private static final String LONG_TIMEOUT = "2000";
+  @NonNls private static final String SHORT_TIMEOUT = "100";
+
+  private final ClipboardHandler myClipboardHandler;
+
+  public static ClipboardSynchronizer getInstance() {
+    return ApplicationManager.getApplication().getComponent(ClipboardSynchronizer.class);
+  }
+
+  public ClipboardSynchronizer() {
+    if (ApplicationManager.getApplication().isHeadlessEnvironment() && ApplicationManager.getApplication().isUnitTestMode()) {
+      myClipboardHandler = new HeadlessClipboardHandler();
+    }
+    else if (Patches.SLOW_GETTING_CLIPBOARD_CONTENTS && SystemInfo.isMac) {
+      myClipboardHandler = new MacClipboardHandler();
+    }
+    else if (Patches.SLOW_GETTING_CLIPBOARD_CONTENTS && SystemInfo.isXWindow) {
+      myClipboardHandler = new XWinClipboardHandler();
+    }
+    else {
+      myClipboardHandler = new ClipboardHandler();
+    }
+  }
+
+  @Override
+  public void initComponent() {
+    myClipboardHandler.init();
+  }
+
+  @Override
+  public void disposeComponent() {
+    myClipboardHandler.dispose();
+  }
+
+  @NotNull
+  @Override
+  public String getComponentName() {
+    return "ClipboardSynchronizer";
+  }
+
+  public boolean isDataFlavorAvailable(@NotNull final DataFlavor dataFlavor) {
+    try {
+      return myClipboardHandler.isDataFlavorAvailable(dataFlavor);
+    }
+    catch (IllegalStateException e) {
+      LOG.info(e);
+      return false;
+    }
+  }
+
+  @Nullable
+  public Transferable getContents() {
+    try {
+      return myClipboardHandler.getContents();
+    }
+    catch (IllegalStateException e) {
+      LOG.info(e);
+      return null;
+    }
+  }
+
+  public void setContent(@NotNull final Transferable content, @NotNull final ClipboardOwner owner) {
+    myClipboardHandler.setContent(content, owner);
+  }
+
+  public void resetContent() {
+    myClipboardHandler.resetContent();
+  }
+
+  private static class ClipboardHandler {
+    public void init() {
+    }
+
+    public void dispose() {
+    }
+
+    public boolean isDataFlavorAvailable(@NotNull final DataFlavor dataFlavor) {
+      return Toolkit.getDefaultToolkit().getSystemClipboard().isDataFlavorAvailable(dataFlavor);
+    }
+
+    @Nullable
+    public Transferable getContents() throws IllegalStateException {
+      IllegalStateException last = null;
+      for (int i = 0; i < 3; i++) {
+        try {
+          return Toolkit.getDefaultToolkit().getSystemClipboard().getContents(this);
+        }
+        catch (IllegalStateException e) {
+          try {
+            //noinspection BusyWait
+            Thread.sleep(50);
+          }
+          catch (InterruptedException ignored) {
+          }
+          last = e;
+        }
+      }
+      throw last;
+    }
+
+    public void setContent(@NotNull final Transferable content, @NotNull final ClipboardOwner owner) {
+      for (int i = 0; i < 3; i++) {
+        try {
+          Toolkit.getDefaultToolkit().getSystemClipboard().setContents(content, owner);
+        }
+        catch (IllegalStateException e) {
+          try {
+            //noinspection BusyWait
+            Thread.sleep(50);
+          }
+          catch (InterruptedException ignored) {
+          }
+          continue;
+        }
+        break;
+      }
+    }
+
+    public void resetContent() {
+    }
+  }
+
+  private static class MacClipboardHandler extends ClipboardHandler {
+    private Pair<String,Transferable> myFullTransferable;
+
+    @Nullable
+    private Transferable doGetContents() throws IllegalStateException {
+      if (Registry.is("ide.mac.useNativeClipboard")) {
+        final Transferable safe = getContentsSafe();
+        if (safe != null) {
+          return safe;
+        }
+      }
+
+      return super.getContents();
+    }
+
+    @Override
+    public boolean isDataFlavorAvailable(@NotNull final DataFlavor dataFlavor) {
+      final Transferable contents = getContents();
+      return contents != null && contents.isDataFlavorSupported(dataFlavor);
+    }
+
+    @Override
+    public Transferable getContents() {
+      Transferable transferable = doGetContents();
+      if (transferable != null && myFullTransferable != null && transferable.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+        try {
+          String stringData = (String) transferable.getTransferData(DataFlavor.stringFlavor);
+          if (stringData != null && stringData.equals(myFullTransferable.getFirst())) {
+            return myFullTransferable.getSecond();
+          }
+        }
+        catch (UnsupportedFlavorException e) {
+          LOG.info(e);
+        }
+        catch (IOException e) {
+          LOG.info(e);
+        }
+      }
+      
+      myFullTransferable = null;
+      return transferable;
+    }
+
+    @Override
+    public void resetContent() {
+      //myFullTransferable = null;
+      super.resetContent();
+    }
+
+    @Override
+    public void setContent(@NotNull final Transferable content, @NotNull final ClipboardOwner owner) {
+      if (Registry.is("ide.mac.useNativeClipboard") && content.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+        try {
+          String stringData = (String) content.getTransferData(DataFlavor.stringFlavor);
+          myFullTransferable = Pair.create(stringData, content);
+          super.setContent(new StringSelection(stringData), owner);
+        }
+        catch (UnsupportedFlavorException e) {
+          LOG.info(e);
+        }
+        catch (IOException e) {
+          LOG.info(e);
+        }
+      } else {
+        myFullTransferable = null;
+        super.setContent(content, owner);
+      }
+    }
+    
+    @Nullable
+    public static Transferable getContentsSafe() {
+      final Ref<Transferable> result = new Ref<Transferable>();
+      
+      Foundation.executeOnMainThread(new Runnable() {
+        @Override
+        public void run() {
+          Transferable transferable = getClipboardContentNatively();
+          if (transferable != null) {
+            result.set(transferable);
+          }
+        }
+      }, true, true);
+
+      return result.get();
+    }
+  }
+  
+  @Nullable
+  private static Transferable getClipboardContentNatively() {
+    String plainText = "public.utf8-plain-text";
+
+    ID pasteboard = Foundation.invoke("NSPasteboard", "generalPasteboard");
+    ID types = Foundation.invoke(pasteboard, "types");
+    IntegerType count = Foundation.invoke(types, "count");
+
+    ID plainTextType = null;
+
+    for (int i = 0; i < count.intValue(); i++) {
+      ID each = Foundation.invoke(types, "objectAtIndex:", i);
+      String eachType = Foundation.toStringViaUTF8(each);
+      if (plainText.equals(eachType)) {
+        plainTextType = each;
+        break;
+      }
+    }
+
+    // will put string value even if we doesn't found java object. this is needed because java caches clipboard value internally and
+    // will reset it ONLY IF we'll put jvm-object into clipboard (see our setContent optimizations which avoids putting jvm-objects 
+    // into clipboard) 
+    
+    Transferable result = null;
+    if (plainTextType != null) {
+      ID text = Foundation.invoke(pasteboard, "stringForType:", plainTextType);
+      String value = Foundation.toStringViaUTF8(text);
+      if (value == null) {
+        LOG.info(String.format("[Clipboard] Strange string value (null?) for type: %s", plainTextType));
+      }
+      else {
+        result = new StringSelection(value);
+      }
+    }
+    
+    return result;
+  }
+
+  private static class XWinClipboardHandler extends ClipboardHandler {
+    private static final FlavorTable FLAVOR_MAP = (FlavorTable)SystemFlavorMap.getDefaultFlavorMap();
+
+    private volatile Transferable myCurrentContent = null;
+
+    @Override
+    public void init() {
+      if (System.getProperty(DATA_TRANSFER_TIMEOUT_PROPERTY) == null) {
+        System.setProperty(DATA_TRANSFER_TIMEOUT_PROPERTY, LONG_TIMEOUT);
+      }
+    }
+
+    @Override
+    public void dispose() {
+      resetContent();
+    }
+
+    @Override
+    public boolean isDataFlavorAvailable(@NotNull final DataFlavor dataFlavor) {
+      final Transferable currentContent = myCurrentContent;
+      if (currentContent != null) {
+        return currentContent.isDataFlavorSupported(dataFlavor);
+      }
+
+      try {
+        final Pair<long[], ? extends Collection<DataFlavor>> contents = checkContentsQuick();
+        if (contents != null) {
+          return contents.second.contains(dataFlavor);
+        }
+
+        return super.isDataFlavorAvailable(dataFlavor);
+      }
+      catch (NullPointerException e) {
+        LOG.warn("Sun bug #6322854", e);
+        return false;
+      }
+    }
+
+    @Override
+    public Transferable getContents() throws IllegalStateException {
+      final Transferable currentContent = myCurrentContent;
+      if (currentContent != null) {
+        return currentContent;
+      }
+
+      try {
+        final Pair<long[], ? extends Collection<DataFlavor>> contents = checkContentsQuick();
+        if (contents != null && contents.second.isEmpty()) {
+          return null;
+        }
+
+        try {
+          return super.getContents();
+        }
+        catch (IllegalArgumentException e) {
+          // todo[r.sh] to remove in IDEA 12.1
+          if (contents != null && "Comparison method violates its general contract!".equals(e.getMessage())) {
+            LOG.error("Cannot sort: " + contents.second + ", atoms: " + atomNames(contents.first), e);
+            return null;
+          }
+          throw e;
+        }
+      }
+      catch (NullPointerException e) {
+        LOG.warn("Sun bug #6322854", e);
+        return null;
+      }
+    }
+
+    private static List<String> atomNames(long[] formats) {
+      try {
+        Class<?> toolkit = Class.forName("sun.awt.X11.XToolkit");
+        Method getDisplay = toolkit.getDeclaredMethod("getDisplay");
+        getDisplay.setAccessible(true);
+        long display = (Long)getDisplay.invoke(null);
+
+        Class<?> wrapper = Class.forName("sun.awt.X11.XlibWrapper");
+        Method getAtomName = wrapper.getDeclaredMethod("XGetAtomName", long.class, long.class);
+        getAtomName.setAccessible(true);
+
+        List<String> atoms = new ArrayList<String>();
+        for (long format : formats) {
+          String name = (String)getAtomName.invoke(null, display, format);
+          atoms.add(format + ":" + name);
+        }
+        return atoms;
+      }
+      catch (Throwable t) {
+        return Collections.emptyList();
+      }
+    }
+
+    @Override
+    public void setContent(@NotNull final Transferable content, @NotNull final ClipboardOwner owner) {
+      myCurrentContent = content;
+      super.setContent(content, owner);
+    }
+
+    @Override
+    public void resetContent() {
+      myCurrentContent = null;
+    }
+
+    /**
+     * Quickly checks availability of data in X11 clipboard selection.
+     *
+     * @return null if is unable to check; empty list if clipboard owner doesn't respond timely;
+     *         collection of available data flavors otherwise.
+     */
+    @Nullable
+    private static Pair<long[], ? extends Collection<DataFlavor>> checkContentsQuick() {
+      final Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+      final Class<? extends Clipboard> aClass = clipboard.getClass();
+      if (!"sun.awt.X11.XClipboard".equals(aClass.getName())) return null;
+
+      final Method getClipboardFormats;
+      try {
+        getClipboardFormats = aClass.getDeclaredMethod("getClipboardFormats");
+        getClipboardFormats.setAccessible(true);
+      }
+      catch (Exception ignore) {
+        return null;
+      }
+
+      final String timeout = System.getProperty(DATA_TRANSFER_TIMEOUT_PROPERTY);
+      System.setProperty(DATA_TRANSFER_TIMEOUT_PROPERTY, SHORT_TIMEOUT);
+
+      try {
+        final long[] formats = (long[])getClipboardFormats.invoke(clipboard);
+        if (formats == null || formats.length == 0) {
+          return Pair.create(formats, Collections.<DataFlavor>emptySet());
+        }
+        @SuppressWarnings({"unchecked"}) final Set<DataFlavor> set = DataTransferer.getInstance().getFlavorsForFormats(formats, FLAVOR_MAP).keySet();
+        return Pair.create(formats, set);
+      }
+      catch (IllegalAccessException ignore) { }
+      catch (IllegalArgumentException ignore) { }
+      catch (InvocationTargetException e) {
+        final Throwable cause = e.getCause();
+        if (cause instanceof IllegalStateException) {
+          throw (IllegalStateException)cause;
+        }
+      }
+      finally {
+        System.setProperty(DATA_TRANSFER_TIMEOUT_PROPERTY, timeout);
+      }
+
+      return null;
+    }
+  }
+
+  private static class HeadlessClipboardHandler extends ClipboardHandler {
+    private volatile Transferable myContent = null;
+
+    @Override
+    public boolean isDataFlavorAvailable(@NotNull final DataFlavor dataFlavor) {
+      final Transferable content = myContent;
+      return content != null && content.isDataFlavorSupported(dataFlavor);
+    }
+
+    @Override
+    public Transferable getContents() throws IllegalStateException {
+      return myContent;
+    }
+
+    @Override
+    public void setContent(@NotNull Transferable content, @NotNull ClipboardOwner owner) {
+      myContent = content;
+    }
+
+    @Override
+    public void resetContent() {
+      myContent = null;
+    }
+  }
+}
